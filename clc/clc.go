@@ -7,7 +7,7 @@ import (
 	//"strconv"
 	"strings"
 
-	clcapi "github.com/CenturyLinkCloud/clc-sdk"
+	clcsdk "github.com/CenturyLinkCloud/clc-sdk"
 	"github.com/CenturyLinkCloud/clc-sdk/api"
 	"github.com/gliderlabs/registrator/bridge"
 )
@@ -31,22 +31,21 @@ func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
 	config, _ := api.EnvConfig()
 	config.UserAgent = "Registrator/Clc-Provider"
 
-	client := clcapi.New(config)
+	client := clcsdk.New(config)
 	return &ClcAdapter{client: client}
 }
 
 type ClcAdapter struct {
-	client *clcapi.Client
+	client *clcsdk.Client
 }
 
-// Ping will try to connect to consul by attempting to retrieve the current leader.
+// Ping will try to connect to clc by attempting to retrieve the list of data centeres.
 func (r *ClcAdapter) Ping() error {
-	status := r.client.Status()
-	leader, err := status.Leader()
+	dcResp, err := r.client.DC.GetAll()
 	if err != nil {
 		return err
 	}
-	log.Println("consul: current leader ", leader)
+	log.Println("clc: number of data centers accessible ", len(dcResp))
 
 	return nil
 }
