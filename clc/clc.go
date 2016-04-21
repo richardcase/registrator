@@ -1,6 +1,7 @@
 package clc
 
 import (
+	"errors"
 	"log"
 	"net/url"
 	"strconv"
@@ -15,12 +16,6 @@ func init() {
 	f := new(Factory)
 	bridge.Register(f, "clc-lb")
 }
-
-//func (r *ClcAdapter) interpolateService(script string, service *bridge.Service) string {
-//	withIp := strings.Replace(script, "$SERVICE_IP", service.Origin.HostIP, -1)
-//	withPort := strings.Replace(withIp, "$SERVICE_PORT", service.Origin.HostPort, -1)
-//	return withPort
-//}
 
 type Factory struct{}
 
@@ -61,6 +56,11 @@ func (r *ClcAdapter) Register(service *bridge.Service) error {
 	if clcAttr != "true" {
 		log.Printf("Service %s not marked for CLC LB", service.Name)
 		return nil
+	}
+
+	// Check that the port is 80 or 443
+	if service.Origin.ExposedPort != "80" || service.Origin.ExposedPort != "443" {
+		return errors.New("A CLC load balancer can only be creaed for port 80 or 443")
 	}
 
 	//TODO: Read the DC from Tags
