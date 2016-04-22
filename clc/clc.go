@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/url"
 	"strconv"
+	"time"
 
 	clcsdk "github.com/CenturyLinkCloud/clc-sdk"
 	"github.com/CenturyLinkCloud/clc-sdk/api"
@@ -25,8 +26,14 @@ func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
 	config.UserAgent = "Registrator/Clc-Provider"
 
 	client := clcsdk.New(config)
-	//TODO: read the datacenter from the URL
-	return &ClcAdapter{client: client, datacenter: "GB3"}
+
+	datacenter := uri.Host
+	if datacenter == "" {
+		datacenter = "GB3"
+	}
+	log.Println(uri.Host)
+
+	return &ClcAdapter{client: client, datacenter: datacenter}
 }
 
 type ClcAdapter struct {
@@ -51,6 +58,34 @@ func (r *ClcAdapter) Register(service *bridge.Service) error {
 	dumpService(service)
 	log.Printf("CLC = %s\n", service.Attrs["clc"])
 
+	//RICHTEST
+	log.Println("In clc Register - ** CALLING GET ALL ON SERVERS")
+	resp, err2 := r.client.DC.Get(r.datacenter)
+	if err2 != nil {
+		return err2
+	}
+
+	hardwareName := r.datacenter + " Hardware"
+	for _, link := range resp.Links {
+		if link.Name == hardwareName {
+			log.Printf("Link Name %s", link.Name)
+			log.Printf("Link Href %s", link.Href)
+			log.Printf("Link ID %s", link.ID)
+			log.Printf("Link Rel %s", link.Rel)
+			log.Printf("Link vergs%s", link.Verbs)
+			groupId := link.ID
+
+			resp2, _ := r.client.Group.Get(groupId)
+
+			for _, sungroup := range resp2.Groups {
+				log.Printf("Sub group name: %s\n", sungroup.Name)
+				log.Printf("Sub group server count: %d\n", sungroup.Serverscount)
+			}
+		}
+
+	}
+	//END RICHTEST
+
 	// get the clc attribute. If it doesn't exist or is set to alse then exist
 	clcAttr := service.Attrs["clc"]
 	if clcAttr != "true" {
@@ -59,7 +94,7 @@ func (r *ClcAdapter) Register(service *bridge.Service) error {
 	}
 
 	// Check that the port is 80 or 443
-	if service.Origin.ExposedPort != "80" || service.Origin.ExposedPort != "443" {
+	if service.Origin.ExposedPort != "80" && service.Origin.ExposedPort != "443" {
 		return errors.New("A CLC load balancer can only be creaed for port 80 or 443")
 	}
 
@@ -69,36 +104,45 @@ func (r *ClcAdapter) Register(service *bridge.Service) error {
 		return err
 	}
 
-	pool, err := r.findOrCreatePool(r.datacenter, *lbDetails, service.Port)
+	portNumber, err := strconv.Atoi(service.Origin.ExposedPort)
 	if err != nil {
 		return err
 	}
 
+	pool, err := r.findOrCreatePool(r.datacenter, *lbDetails, portNumber)
+	if err != nil {
+		return err
+	}
+
+	log.Println("In clc Register - LB/Pool done, add node")
 	// Check the IP address / port combination isn't already in the pool
 	nodeExists := false
 	for _, node := range pool.Nodes {
-		if node.IPaddress == service.Origin.ExposedIP &&
-			string(node.PrivatePort) == service.Origin.ExposedPort {
+		if r.nodeMatchesService(node, service) {
 			nodeExists = true
 		}
 	}
+	log.Printf("In clc Register - Node exists %t\n", nodeExists)
 
 	// Pool node doesn't exist so createdPool
 	if nodeExists == false {
 		newNode := new(lb.Node)
-		newNode.IPaddress = service.Origin.ExposedIP
-		exposedPort, err := strconv.Atoi(service.Origin.ExposedPort)
+		newNode.IPaddress = service.Origin.HostIP
+		hostPort, err := strconv.Atoi(service.Origin.HostPort)
 		if err != nil {
 			return err
 		}
-		newNode.PrivatePort = exposedPort
+		newNode.PrivatePort = hostPort
 
-		pool.Nodes = r.addNodeToPool(pool.Nodes, *newNode)
+		_ = r.addNode(pool.Nodes, *newNode)
 
-		err = r.client.LB.UpdatePool(r.datacenter, lbDetails.ID, pool.ID, *pool)
+		log.Println("In clc Register - calling SDK to update nodes in pool")
+		err = r.client.LB.UpdateNodes(r.datacenter, lbDetails.ID, pool.ID, *newNode)
+
 		if err != nil {
 			return err
 		}
+		log.Println("In clc Register - call to SDK to update nodes in pool completed")
 	}
 
 	return nil
@@ -133,29 +177,37 @@ func (r *ClcAdapter) Services() ([]*bridge.Service, error) {
 }
 
 func (r *ClcAdapter) findOrCreatePool(dc string, loadBalancer lb.LoadBalancer, poolPort int) (*lb.Pool, error) {
+	log.Println("In clc findOrCreatePool")
 	pool := r.findPool(dc, loadBalancer, poolPort)
 	if pool != nil {
 		return pool, nil
 	}
+	log.Println("In clc findOrCreatePool - pool not found")
 
 	// Create a new pool as it wasn't found
 	newPool := new(lb.Pool)
 	newPool.Port = poolPort
 
+	log.Println("In clc findOrCreatePool - calling sdk to create pool")
 	createdPool, err := r.client.LB.CreatePool(dc, loadBalancer.ID, *newPool)
+
 	if err != nil {
 		return nil, err
 	}
+	log.Println("In clc findOrCreatePool - sdk called, pool created")
 
 	return createdPool, nil
 }
 
 func (r *ClcAdapter) findPool(dc string, loadBalancer lb.LoadBalancer, poolPort int) *lb.Pool {
+	log.Println("In clc findPool")
 	for _, pool := range loadBalancer.Pools {
 		if pool.Port == poolPort {
+			log.Println("In clc findPool - existing pool found")
 			return &pool
 		}
 	}
+	log.Println("In clc findPool - No existing pool found")
 	return nil
 }
 
@@ -182,6 +234,10 @@ func (r *ClcAdapter) findOrCreateLoadBalancer(dc string, lbName string) (*lb.Loa
 		return nil, err
 	}
 
+	log.Printf("In clc findOrCreateLoadBalancer  - LB Created with ID: %s\n", createdLb.ID)
+	log.Println("In clc findOrCreateLoadBalancer - sleeping posr LB create")
+	time.Sleep(1 * time.Second)
+
 	return createdLb, nil
 }
 
@@ -203,7 +259,7 @@ func (r *ClcAdapter) findLoadBalancer(dc string, lbName string) (*lb.LoadBalance
 	return nil, nil
 }
 
-func (r *ClcAdapter) addNodeToPool(nodes []lb.Node, node lb.Node) []lb.Node {
+func (r *ClcAdapter) addNode(nodes []lb.Node, node lb.Node) []lb.Node {
 	currentLen := len(nodes)
 	if currentLen == cap(nodes) {
 		newPoolNodes := make([]lb.Node, currentLen, currentLen+1)
@@ -244,7 +300,7 @@ func (r *ClcAdapter) removeServiceFromPool(service *bridge.Service, loadBalanace
 }
 
 func (r *ClcAdapter) nodeMatchesService(node lb.Node, service *bridge.Service) bool {
-	return node.IPaddress == service.Origin.ExposedIP && string(node.PrivatePort) == service.Origin.ExposedPort
+	return node.IPaddress == service.Origin.HostIP && string(node.PrivatePort) == service.Origin.HostPort
 }
 
 func (r *ClcAdapter) cleanupLoadbalancer(loadBalancerID string) error {
@@ -293,6 +349,10 @@ func (r *ClcAdapter) deleteEmptyPools(pools []lb.Pool, loadBalancerID string) er
 	return nil
 }
 
+func (r *ClcAdapter) findClcHostServer(string hostname, string ipAddress) (string, error) {
+
+}
+
 func dumpService(service *bridge.Service) {
 	log.Println("In clc Register")
 	log.Printf("Service Name: %s\n", service.Name)
@@ -305,4 +365,14 @@ func dumpService(service *bridge.Service) {
 	for key, value := range service.Attrs {
 		log.Printf("Attribute %s = %s\n", key, value)
 	}
+	log.Printf("Origin Container Hostname: %s\n", service.Origin.ContainerHostname)
+	log.Printf("Origin Container ID: %s\n", service.Origin.ContainerID)
+	log.Printf("Origin Container Name: %s\n", service.Origin.ContainerName)
+	log.Printf("Origin Exposed IP: %s\n", service.Origin.ExposedIP)
+	log.Printf("Origin Exposed Port: %s\n", service.Origin.ExposedPort)
+	log.Printf("Origin Host IP: %s\n", service.Origin.HostIP)
+	log.Printf("Origin Host Port: %s\n", service.Origin.HostPort)
+	log.Printf("Origin Port Type: %s\n", service.Origin.PortType)
+
+	log.Println(service)
 }

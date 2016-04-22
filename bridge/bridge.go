@@ -237,6 +237,19 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 		port.HostIP = b.config.HostIp
 	}
 
+	// RMC  - This is for testing purposes remove before completing
+	if port.HostIP == "" {
+		log.Printf("**RICHTEST: b.config.HostIP %s", b.config.HostIp)
+		log.Printf("**RICHTEST: port.HostIP %s", port.HostIP)
+		u, _ := url.Parse(b.docker.Endpoint())
+		log.Printf("**RICHTEST: endpoint scheme %s", u.Scheme)
+		log.Printf("**RICHTEST: endpoint url %s", u.Host)
+		hostparts := strings.Split(u.Host, ":")
+		log.Printf("**RICHTEST: endpoint host part %s", hostparts[0])
+		log.Printf("**RICHTEST: endpoint port part %s", hostparts[1])
+		port.HostIP = hostparts[0]
+	}
+
 	metadata, metadataFromPort := serviceMetaData(container.Config, port.ExposedPort)
 
 	ignore := mapDefault(metadata, "ignore", "")
