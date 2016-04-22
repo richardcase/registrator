@@ -2,14 +2,17 @@ package clc
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 
 	clcsdk "github.com/CenturyLinkCloud/clc-sdk"
 	"github.com/CenturyLinkCloud/clc-sdk/api"
 	"github.com/CenturyLinkCloud/clc-sdk/lb"
+	"github.com/CenturyLinkCloud/clc-sdk/server"
 	"github.com/gliderlabs/registrator/bridge"
 )
 
@@ -21,7 +24,12 @@ func init() {
 type Factory struct{}
 
 func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
-	log.Println("In clc New")
+	// Are we running in debug mode CLC_REG_DEBUG
+	debug := false
+	if v := os.Getenv("CLC_REG_DEBUG"); v == "true" {
+		debug = true
+	}
+
 	config, _ := api.EnvConfig()
 	config.UserAgent = "Registrator/Clc-Provider"
 
@@ -33,63 +41,36 @@ func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
 	}
 	log.Println(uri.Host)
 
-	return &ClcAdapter{client: client, datacenter: datacenter}
+	return &ClcAdapter{client: client, datacenter: datacenter, debug: debug}
 }
 
 type ClcAdapter struct {
 	client     *clcsdk.Client
 	datacenter string
+	debug      bool
 }
 
 // Ping will try to connect to clc by attempting to retrieve the list of data centeres.
 func (r *ClcAdapter) Ping() error {
-	log.Println("In clc Ping")
-	dcResp, err := r.client.DC.GetAll()
+	r.debugMessage("Entering Ping")
+
+	_, err := r.client.DC.Get(r.datacenter)
 	if err != nil {
 		return err
 	}
-	log.Println("clc: number of data centers accessible ", len(dcResp))
+	r.logMessage("Ping succesfull. Data center details retrieved for %s", r.datacenter)
 
 	return nil
 }
 
 func (r *ClcAdapter) Register(service *bridge.Service) error {
-	log.Println("In clc Register")
-	dumpService(service)
-	log.Printf("CLC = %s\n", service.Attrs["clc"])
-
-	//RICHTEST
-	log.Println("In clc Register - ** CALLING GET ALL ON SERVERS")
-	resp, err2 := r.client.DC.Get(r.datacenter)
-	if err2 != nil {
-		return err2
-	}
-
-	hardwareName := r.datacenter + " Hardware"
-	for _, link := range resp.Links {
-		if link.Name == hardwareName {
-			log.Printf("Link Name %s", link.Name)
-			log.Printf("Link Href %s", link.Href)
-			log.Printf("Link ID %s", link.ID)
-			log.Printf("Link Rel %s", link.Rel)
-			log.Printf("Link vergs%s", link.Verbs)
-			groupId := link.ID
-
-			resp2, _ := r.client.Group.Get(groupId)
-
-			for _, sungroup := range resp2.Groups {
-				log.Printf("Sub group name: %s\n", sungroup.Name)
-				log.Printf("Sub group server count: %d\n", sungroup.Serverscount)
-			}
-		}
-
-	}
-	//END RICHTEST
+	r.debugMessage("Enter Register")
+	r.dumpService(service)
 
 	// get the clc attribute. If it doesn't exist or is set to alse then exist
 	clcAttr := service.Attrs["clc"]
 	if clcAttr != "true" {
-		log.Printf("Service %s not marked for CLC LB", service.Name)
+		r.logMessage("Service %s not marked for CLC LB", service.Name)
 		return nil
 	}
 
@@ -114,43 +95,53 @@ func (r *ClcAdapter) Register(service *bridge.Service) error {
 		return err
 	}
 
-	log.Println("In clc Register - LB/Pool done, add node")
+	// Get the internal IP address for the host
+	internalIPAddress, err := r.findClcInternalIPByPublicIP(service.Origin.HostIP)
+	if err != nil {
+		return err
+	}
+
 	// Check the IP address / port combination isn't already in the pool
 	nodeExists := false
 	for _, node := range pool.Nodes {
-		if r.nodeMatchesService(node, service) {
+
+		serviceHostPort, err := strconv.Atoi(service.Origin.HostPort)
+		if err != nil {
+			return err
+		}
+
+		if r.nodeMatchesService(node, internalIPAddress, serviceHostPort) {
 			nodeExists = true
 		}
 	}
-	log.Printf("In clc Register - Node exists %t\n", nodeExists)
 
 	// Pool node doesn't exist so createdPool
 	if nodeExists == false {
 		newNode := new(lb.Node)
-		newNode.IPaddress = service.Origin.HostIP
+		newNode.IPaddress = internalIPAddress
 		hostPort, err := strconv.Atoi(service.Origin.HostPort)
 		if err != nil {
 			return err
 		}
 		newNode.PrivatePort = hostPort
 
-		_ = r.addNode(pool.Nodes, *newNode)
+		poolNodes := r.addNode(pool.Nodes, *newNode)
 
-		log.Println("In clc Register - calling SDK to update nodes in pool")
-		err = r.client.LB.UpdateNodes(r.datacenter, lbDetails.ID, pool.ID, *newNode)
+		r.debugMessage("Register - calling SDK to update nodes in pool")
+		err = r.client.LB.UpdateNodes(r.datacenter, lbDetails.ID, pool.ID, poolNodes...)
 
 		if err != nil {
 			return err
 		}
-		log.Println("In clc Register - call to SDK to update nodes in pool completed")
+		r.debugMessage("Register - call to SDK to update nodes in pool complete")
 	}
 
 	return nil
-
 }
 
 func (r *ClcAdapter) Deregister(service *bridge.Service) error {
-	log.Println("In clc Deregister")
+	r.debugMessage("Enter Deregister")
+
 	// Get the load balancer
 	lbDetails, err := r.findLoadBalancer(r.datacenter, service.Name)
 	if err != nil {
@@ -163,56 +154,65 @@ func (r *ClcAdapter) Deregister(service *bridge.Service) error {
 		return err
 	}
 
+	//cleanup
+	err = r.cleanupLoadbalancer(lbDetails.ID)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (r *ClcAdapter) Refresh(service *bridge.Service) error {
-	log.Println("In clc Refresh")
+	r.debugMessage("Enter Refresh")
+
 	return nil
 }
 
 func (r *ClcAdapter) Services() ([]*bridge.Service, error) {
-	log.Println("In clc Services")
+	r.debugMessage("Enter Services")
+
 	return []*bridge.Service{}, nil
 }
 
 func (r *ClcAdapter) findOrCreatePool(dc string, loadBalancer lb.LoadBalancer, poolPort int) (*lb.Pool, error) {
-	log.Println("In clc findOrCreatePool")
+	r.debugMessage("Enter findOrCreatePool")
+
 	pool := r.findPool(dc, loadBalancer, poolPort)
 	if pool != nil {
 		return pool, nil
 	}
-	log.Println("In clc findOrCreatePool - pool not found")
 
 	// Create a new pool as it wasn't found
 	newPool := new(lb.Pool)
 	newPool.Port = poolPort
 
-	log.Println("In clc findOrCreatePool - calling sdk to create pool")
+	r.debugMessage("findOrCreatePool - calling sdk to create pool")
 	createdPool, err := r.client.LB.CreatePool(dc, loadBalancer.ID, *newPool)
 
 	if err != nil {
 		return nil, err
 	}
-	log.Println("In clc findOrCreatePool - sdk called, pool created")
+	r.debugMessage("findOrCreatePool - called sdk to create pool")
 
 	return createdPool, nil
 }
 
 func (r *ClcAdapter) findPool(dc string, loadBalancer lb.LoadBalancer, poolPort int) *lb.Pool {
-	log.Println("In clc findPool")
+	r.debugMessage("Enter findPool")
+
 	for _, pool := range loadBalancer.Pools {
 		if pool.Port == poolPort {
-			log.Println("In clc findPool - existing pool found")
 			return &pool
 		}
 	}
-	log.Println("In clc findPool - No existing pool found")
+
 	return nil
 }
 
 func (r *ClcAdapter) findOrCreateLoadBalancer(dc string, lbName string) (*lb.LoadBalancer, error) {
-	log.Println("In clc findOrCreateLoadBalancer")
+	r.debugMessage("Enter findOrCreateLoadBalancer")
+
 	foundLb, err := r.findLoadBalancer(dc, lbName)
 	if err != nil {
 		return nil, err
@@ -223,26 +223,26 @@ func (r *ClcAdapter) findOrCreateLoadBalancer(dc string, lbName string) (*lb.Loa
 	}
 
 	// Load balancer wasn't found so create
-	log.Println("In clc: load balancer not found so about to create")
 	newLb := new(lb.LoadBalancer)
 	newLb.Name = lbName
 	newLb.Description = "Created by registrator" //TODO: add extra detail
 
-	log.Println("In clc: calling LB create SDK")
+	r.debugMessage("findOrCreateLoadBalancer - calling SDK to create LB")
 	createdLb, err := r.client.LB.Create(dc, *newLb)
 	if err != nil {
 		return nil, err
 	}
+	r.debugMessage("findOrCreateLoadBalancer - called SDK to create LB")
 
-	log.Printf("In clc findOrCreateLoadBalancer  - LB Created with ID: %s\n", createdLb.ID)
-	log.Println("In clc findOrCreateLoadBalancer - sleeping posr LB create")
-	time.Sleep(1 * time.Second)
+	// Sleeping to allow time for backend to catchup up
+	time.Sleep(500 * time.Millisecond)
 
 	return createdLb, nil
 }
 
 func (r *ClcAdapter) findLoadBalancer(dc string, lbName string) (*lb.LoadBalancer, error) {
-	log.Println("In clc findLoadBalancer")
+	r.debugMessage("Enter findLoadBalancer")
+
 	foundLb, err := r.client.LB.GetAll(r.datacenter)
 
 	if err != nil {
@@ -260,6 +260,8 @@ func (r *ClcAdapter) findLoadBalancer(dc string, lbName string) (*lb.LoadBalance
 }
 
 func (r *ClcAdapter) addNode(nodes []lb.Node, node lb.Node) []lb.Node {
+	r.debugMessage("Enter addNode")
+
 	currentLen := len(nodes)
 	if currentLen == cap(nodes) {
 		newPoolNodes := make([]lb.Node, currentLen, currentLen+1)
@@ -273,6 +275,8 @@ func (r *ClcAdapter) addNode(nodes []lb.Node, node lb.Node) []lb.Node {
 }
 
 func (r *ClcAdapter) removeServiceFromLoadBalancer(service *bridge.Service, loadBalancer lb.LoadBalancer) error {
+	r.debugMessage("Enter removeServiceFromLoadBalancer")
+
 	// Remove service from pools
 	for _, pool := range loadBalancer.Pools {
 		err := r.removeServiceFromPool(service, loadBalancer, pool)
@@ -284,12 +288,28 @@ func (r *ClcAdapter) removeServiceFromLoadBalancer(service *bridge.Service, load
 }
 
 func (r *ClcAdapter) removeServiceFromPool(service *bridge.Service, loadBalanacer lb.LoadBalancer, pool lb.Pool) error {
+	r.debugMessage("Enter removeServiceFromPool")
+
+	// Get the internal IP address for the host
+	internalIPAddress, err := r.findClcInternalIPByPublicIP(service.Origin.HostIP)
+	if err != nil {
+		return err
+	}
+	r.debugMessage("removeServiceFromPool - found internal IP address: %s\n", internalIPAddress)
+
 	for i, node := range pool.Nodes {
-		if r.nodeMatchesService(node, service) {
+		serviceHostPort, err := strconv.Atoi(service.Origin.HostPort)
+		if err != nil {
+			return err
+		}
+
+		if r.nodeMatchesService(node, internalIPAddress, serviceHostPort) {
+			r.debugMessage("removeServiceFromPool - found matching node\n")
+
 			//NOTE: assumption is that there is one match only. This needs testing
 			pool.Nodes = append(pool.Nodes[:i], pool.Nodes[i+1:]...)
 
-			err := r.client.LB.UpdatePool(r.datacenter, loadBalanacer.ID, pool.ID, pool)
+			err := r.client.LB.UpdateNodes(r.datacenter, loadBalanacer.ID, pool.ID, pool.Nodes...)
 			if err != nil {
 				return err
 			}
@@ -299,11 +319,15 @@ func (r *ClcAdapter) removeServiceFromPool(service *bridge.Service, loadBalanace
 	return nil
 }
 
-func (r *ClcAdapter) nodeMatchesService(node lb.Node, service *bridge.Service) bool {
-	return node.IPaddress == service.Origin.HostIP && string(node.PrivatePort) == service.Origin.HostPort
+func (r *ClcAdapter) nodeMatchesService(node lb.Node, serviceHostInternalIPAddress string, serviceHostPort int) bool {
+	r.debugMessage("Enter nodeMatchesService")
+
+	return node.IPaddress == serviceHostInternalIPAddress && node.PrivatePort == serviceHostPort
 }
 
 func (r *ClcAdapter) cleanupLoadbalancer(loadBalancerID string) error {
+	r.debugMessage("Enter cleanupLoadbalancer")
+
 	loadBalancer, err := r.client.LB.Get(r.datacenter, loadBalancerID)
 	if err != nil {
 		return err
@@ -328,6 +352,8 @@ func (r *ClcAdapter) cleanupLoadbalancer(loadBalancerID string) error {
 }
 
 func (r *ClcAdapter) poolsAreEmpty(pools []lb.Pool) bool {
+	r.debugMessage("Enter  poolsAreEmpty")
+
 	for _, pool := range pools {
 		if len(pool.Nodes) > 0 {
 			return false
@@ -337,42 +363,125 @@ func (r *ClcAdapter) poolsAreEmpty(pools []lb.Pool) bool {
 }
 
 func (r *ClcAdapter) deleteEmptyPools(pools []lb.Pool, loadBalancerID string) error {
+	r.debugMessage("Enter deleteEmptyPools")
+
 	for _, pool := range pools {
 		if len(pool.Nodes) == 0 {
+			r.debugMessage("deleteEmptyPools - calling sdk to delete pool")
 			err := r.client.LB.DeletePool(r.datacenter, loadBalancerID, pool.ID)
 			if err != nil {
 				return err
 			}
+			r.debugMessage("deleteEmptyPools - called sdk to delete pool")
 		}
 	}
 
 	return nil
 }
 
-func (r *ClcAdapter) findClcHostServer(string hostname, string ipAddress) (string, error) {
+func (r *ClcAdapter) findClcInternalIPByPublicIP(publicIP string) (string, error) {
+	r.debugMessage("Enter findClcInternalIPByPublicIP")
 
+	resp, err := r.client.DC.Get(r.datacenter)
+	if err != nil {
+		return "", err
+	}
+
+	for _, link := range resp.Links {
+		if link.Rel == "group" {
+			internalIP, err := r.findServerInternalIPInGroupByPublicIP(publicIP, link.ID)
+			if err != nil {
+				return "", err
+			}
+			if internalIP != "" {
+				return internalIP, nil
+			}
+		}
+	}
+
+	return "", nil
 }
 
-func dumpService(service *bridge.Service) {
-	log.Println("In clc Register")
-	log.Printf("Service Name: %s\n", service.Name)
-	log.Printf("Service ID: %s\n", service.ID)
-	log.Printf("Service IP: %s\n", service.IP)
-	log.Printf("Service Port: %s\n", string(service.Port))
-	log.Printf("Service TTL: %s\n", string(service.TTL))
-	log.Printf("Service Tags: %s\n", service.Tags)
-	log.Printf("Service Attrs: %s\n", service.Attrs)
-	for key, value := range service.Attrs {
-		log.Printf("Attribute %s = %s\n", key, value)
-	}
-	log.Printf("Origin Container Hostname: %s\n", service.Origin.ContainerHostname)
-	log.Printf("Origin Container ID: %s\n", service.Origin.ContainerID)
-	log.Printf("Origin Container Name: %s\n", service.Origin.ContainerName)
-	log.Printf("Origin Exposed IP: %s\n", service.Origin.ExposedIP)
-	log.Printf("Origin Exposed Port: %s\n", service.Origin.ExposedPort)
-	log.Printf("Origin Host IP: %s\n", service.Origin.HostIP)
-	log.Printf("Origin Host Port: %s\n", service.Origin.HostPort)
-	log.Printf("Origin Port Type: %s\n", service.Origin.PortType)
+func (r *ClcAdapter) findServerInternalIPInGroupByPublicIP(publicIP string, groupID string) (string, error) {
+	r.debugMessage("Enter findServerInternalIPInGroupByPublicIP")
 
-	log.Println(service)
+	resp, err := r.client.Group.Get(groupID)
+	if err != nil {
+		return "", err
+	}
+
+	// Check the current groups servers first
+	for _, serverName := range resp.Servers() {
+		serverResp, err := r.client.Server.Get(serverName)
+		if err != nil {
+			return "", err
+		}
+		internalIP := r.serverGetInteralFromPublic(*serverResp, publicIP)
+		if internalIP != "" {
+			return internalIP, nil
+		}
+	}
+
+	// Loop round the subgroups
+	for _, subGroup := range resp.Groups {
+		serverNameResp, err := r.findServerInternalIPInGroupByPublicIP(publicIP, subGroup.ID)
+		if err != nil {
+			return "", err
+		}
+		if serverNameResp != "" {
+			return serverNameResp, nil
+		}
+	}
+
+	// Nothing found so return
+	return "", nil
+}
+
+func (r *ClcAdapter) serverGetInteralFromPublic(server server.Response, ipAddress string) string {
+	r.debugMessage("Enter serverGetInteralFromPublic")
+
+	if len(server.Details.IPaddresses) == 0 {
+		return ""
+	}
+
+	for _, address := range server.Details.IPaddresses {
+		if address.Public == ipAddress {
+			return address.Internal
+		}
+	}
+
+	return ""
+}
+
+func (r *ClcAdapter) logMessage(message string, v ...interface{}) {
+	formattedMessage := fmt.Sprintf(message, v)
+	log.Printf("CLC - INFO - %s\n", formattedMessage)
+}
+
+func (r *ClcAdapter) debugMessage(message string, v ...interface{}) {
+	if r.debug {
+		formattedMessage := fmt.Sprintf(message, v)
+		log.Printf("CLC - DBG - %s\n", formattedMessage)
+	}
+}
+
+func (r *ClcAdapter) dumpService(service *bridge.Service) {
+	r.debugMessage("Service Name: %s\n", service.Name)
+	r.debugMessage("Service ID: %s\n", service.ID)
+	r.debugMessage("Service IP: %s\n", service.IP)
+	r.debugMessage("Service Port: %s\n", string(service.Port))
+	r.debugMessage("Service TTL: %s\n", string(service.TTL))
+	r.debugMessage("Service Tags: %s\n", service.Tags)
+	r.debugMessage("Service Attrs: %s\n", service.Attrs)
+	for key, value := range service.Attrs {
+		r.debugMessage("Attribute %s = %s\n", key, value)
+	}
+	r.debugMessage("Origin Container Hostname: %s\n", service.Origin.ContainerHostname)
+	r.debugMessage("Origin Container ID: %s\n", service.Origin.ContainerID)
+	r.debugMessage("Origin Container Name: %s\n", service.Origin.ContainerName)
+	r.debugMessage("Origin Exposed IP: %s\n", service.Origin.ExposedIP)
+	r.debugMessage("Origin Exposed Port: %s\n", service.Origin.ExposedPort)
+	r.debugMessage("Origin Host IP: %s\n", service.Origin.HostIP)
+	r.debugMessage("Origin Host Port: %s\n", service.Origin.HostPort)
+	r.debugMessage("Origin Port Type: %s\n", service.Origin.PortType)
 }
