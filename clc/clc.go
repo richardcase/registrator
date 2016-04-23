@@ -100,6 +100,11 @@ func (r *ClcAdapter) Register(service *bridge.Service) error {
 	if err != nil {
 		return err
 	}
+	if internalIPAddress == "" {
+		errMsg := fmt.Sprintf("The internal IP address for docker host %s couldn't be found", service.Origin.HostIP)
+		return errors.New(errMsg)
+	}
+	r.logMessage("Found internal IP %s for docker host with public IP %s", internalIPAddress, service.Origin.HostIP)
 
 	// Check the IP address / port combination isn't already in the pool
 	nodeExists := false
@@ -111,6 +116,7 @@ func (r *ClcAdapter) Register(service *bridge.Service) error {
 		}
 
 		if r.nodeMatchesService(node, internalIPAddress, serviceHostPort) {
+			r.logMessage("A node with IP address %s and port %d already exists in load balancer %s", internalIPAddress, serviceHostPort, lbDetails.Name)
 			nodeExists = true
 		}
 	}
@@ -129,11 +135,13 @@ func (r *ClcAdapter) Register(service *bridge.Service) error {
 
 		r.debugMessage("Register - calling SDK to update nodes in pool")
 		err = r.client.LB.UpdateNodes(r.datacenter, lbDetails.ID, pool.ID, poolNodes...)
+		r.debugMessage("Register - call to SDK to update nodes in pool complete")
 
 		if err != nil {
 			return err
 		}
-		r.debugMessage("Register - call to SDK to update nodes in pool complete")
+		r.logMessage("Added node with IP address %s and port %d to pool %s", internalIPAddress, hostPort, pool.ID)
+
 	}
 
 	return nil
@@ -189,11 +197,12 @@ func (r *ClcAdapter) findOrCreatePool(dc string, loadBalancer lb.LoadBalancer, p
 
 	r.debugMessage("findOrCreatePool - calling sdk to create pool")
 	createdPool, err := r.client.LB.CreatePool(dc, loadBalancer.ID, *newPool)
+	r.debugMessage("findOrCreatePool - called sdk to create pool")
 
 	if err != nil {
 		return nil, err
 	}
-	r.debugMessage("findOrCreatePool - called sdk to create pool")
+	r.logMessage("Created new pool for port number %s and load balancer %s. New pool id is %s", poolPort, loadBalancer.Name, createdPool.ID)
 
 	return createdPool, nil
 }
@@ -223,19 +232,21 @@ func (r *ClcAdapter) findOrCreateLoadBalancer(dc string, lbName string) (*lb.Loa
 	}
 
 	// Load balancer wasn't found so create
+	currentTime := time.Now()
 	newLb := new(lb.LoadBalancer)
 	newLb.Name = lbName
-	newLb.Description = "Created by registrator" //TODO: add extra detail
+	newLb.Description = fmt.Sprintf("Created by registrator at %s", currentTime.Format("2006-01-02 15:02:02"))
 
 	r.debugMessage("findOrCreateLoadBalancer - calling SDK to create LB")
 	createdLb, err := r.client.LB.Create(dc, *newLb)
+	r.debugMessage("findOrCreateLoadBalancer - called SDK to create LB")
 	if err != nil {
 		return nil, err
 	}
-	r.debugMessage("findOrCreateLoadBalancer - called SDK to create LB")
+	r.logMessage("Created new load balancer with name %s. New load balancer id is %s and IP is %s", lbName, createdLb.ID, createdLb.IPaddress)
 
 	// Sleeping to allow time for backend to catchup up
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
 	return createdLb, nil
 }
@@ -243,7 +254,9 @@ func (r *ClcAdapter) findOrCreateLoadBalancer(dc string, lbName string) (*lb.Loa
 func (r *ClcAdapter) findLoadBalancer(dc string, lbName string) (*lb.LoadBalancer, error) {
 	r.debugMessage("Enter findLoadBalancer")
 
+	r.debugMessage("findLoadBalancer - calling SDK to get all LBs")
 	foundLb, err := r.client.LB.GetAll(r.datacenter)
+	r.debugMessage("findLoadBalancer - called SDK to get all LBs")
 
 	if err != nil {
 		return nil, err
@@ -309,10 +322,15 @@ func (r *ClcAdapter) removeServiceFromPool(service *bridge.Service, loadBalanace
 			//NOTE: assumption is that there is one match only. This needs testing
 			pool.Nodes = append(pool.Nodes[:i], pool.Nodes[i+1:]...)
 
+			r.debugMessage("removeServiceFromPool - calling SDK to update nodes in LB pool")
 			err := r.client.LB.UpdateNodes(r.datacenter, loadBalanacer.ID, pool.ID, pool.Nodes...)
+			r.debugMessage("removeServiceFromPool - called SDK to update nodes in LB pool")
+
 			if err != nil {
 				return err
 			}
+
+			r.logMessage("Updated nodes in pool %s", pool.ID)
 			break
 		}
 	}
@@ -328,17 +346,26 @@ func (r *ClcAdapter) nodeMatchesService(node lb.Node, serviceHostInternalIPAddre
 func (r *ClcAdapter) cleanupLoadbalancer(loadBalancerID string) error {
 	r.debugMessage("Enter cleanupLoadbalancer")
 
+	r.debugMessage("cleanupLoadbalancer - calling SDK to get load balancer details")
 	loadBalancer, err := r.client.LB.Get(r.datacenter, loadBalancerID)
+	r.debugMessage("cleanupLoadbalancer - called SDK to get load balancer detailsl")
+
 	if err != nil {
 		return err
 	}
 
 	// If all the pools are empty then delete the loadBalancer
 	if r.poolsAreEmpty(loadBalancer.Pools) {
+
+		r.debugMessage("cleanupLoadbalancer - calling SDK delete load balancer")
 		err := r.client.LB.Delete(r.datacenter, loadBalancer.ID)
+		r.debugMessage("cleanupLoadbalancer - called SDK delete load balancer")
+
 		if err != nil {
 			return err
 		}
+
+		r.logMessage("Deleted load balanacer %s as all pools are empty", loadBalancer.Name)
 		return nil
 	}
 
@@ -367,12 +394,16 @@ func (r *ClcAdapter) deleteEmptyPools(pools []lb.Pool, loadBalancerID string) er
 
 	for _, pool := range pools {
 		if len(pool.Nodes) == 0 {
+
 			r.debugMessage("deleteEmptyPools - calling sdk to delete pool")
 			err := r.client.LB.DeletePool(r.datacenter, loadBalancerID, pool.ID)
+			r.debugMessage("deleteEmptyPools - called sdk to delete pool")
+
 			if err != nil {
 				return err
 			}
-			r.debugMessage("deleteEmptyPools - called sdk to delete pool")
+
+			r.logMessage("Deleted pool %s as it contained no nodes", pool.ID)
 		}
 	}
 
@@ -382,7 +413,10 @@ func (r *ClcAdapter) deleteEmptyPools(pools []lb.Pool, loadBalancerID string) er
 func (r *ClcAdapter) findClcInternalIPByPublicIP(publicIP string) (string, error) {
 	r.debugMessage("Enter findClcInternalIPByPublicIP")
 
+	r.debugMessage("findClcInternalIPByPublicIP - calling sdk to get DC details")
 	resp, err := r.client.DC.Get(r.datacenter)
+	r.debugMessage("findClcInternalIPByPublicIP - called sdk to get DC details")
+
 	if err != nil {
 		return "", err
 	}
@@ -405,14 +439,20 @@ func (r *ClcAdapter) findClcInternalIPByPublicIP(publicIP string) (string, error
 func (r *ClcAdapter) findServerInternalIPInGroupByPublicIP(publicIP string, groupID string) (string, error) {
 	r.debugMessage("Enter findServerInternalIPInGroupByPublicIP")
 
+	r.debugMessage("findServerInternalIPInGroupByPublicIP - calling sdk to get group details")
 	resp, err := r.client.Group.Get(groupID)
+	r.debugMessage("findServerInternalIPInGroupByPublicIP - called sdk to get group details")
+
 	if err != nil {
 		return "", err
 	}
 
 	// Check the current groups servers first
 	for _, serverName := range resp.Servers() {
+		r.debugMessage("findServerInternalIPInGroupByPublicIP - calling sdk to get server details")
 		serverResp, err := r.client.Server.Get(serverName)
+		r.debugMessage("findServerInternalIPInGroupByPublicIP - called sdk to get server details")
+
 		if err != nil {
 			return "", err
 		}
