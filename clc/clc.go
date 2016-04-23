@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -24,6 +25,16 @@ func init() {
 type Factory struct{}
 
 func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		log.Printf("Interface name: %s\n", i.Name)
+		addrss, _ := i.Addrs()
+		for _, a := range addrss {
+			log.Printf("Address network: %s", a.Network())
+			log.Printf("Address : %s", a.String())
+		}
+	}
+
 	// Are we running in debug mode CLC_REG_DEBUG
 	debug := false
 	if v := os.Getenv("CLC_REG_DEBUG"); v == "true" {
@@ -533,5 +544,4 @@ func (r *ClcAdapter) dumpClcEnvironment() {
 	r.debugMessage("CLC_USER: %s\n", os.Getenv("CLC_USER"))
 	r.debugMessage("CLC_PASSWORD: %s\n", os.Getenv("CLC_PASSWORD"))
 	r.debugMessage("CLC_ALIAS: %s\n", os.Getenv("CLC_ALIAS"))
-	r.debugMessage("CLC_HOSTNAME: %s\n", os.Getenv("CLC_HOSTNAME"))
 }
