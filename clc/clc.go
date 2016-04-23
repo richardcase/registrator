@@ -66,6 +66,7 @@ func (r *ClcAdapter) Ping() error {
 func (r *ClcAdapter) Register(service *bridge.Service) error {
 	r.debugMessage("Enter Register")
 	r.dumpService(service)
+	r.dumpClcEnvironment()
 
 	// get the clc attribute. If it doesn't exist or is set to alse then exist
 	clcAttr := service.Attrs["clc"]
@@ -524,4 +525,13 @@ func (r *ClcAdapter) dumpService(service *bridge.Service) {
 	r.debugMessage("Origin Host IP: %s\n", service.Origin.HostIP)
 	r.debugMessage("Origin Host Port: %s\n", service.Origin.HostPort)
 	r.debugMessage("Origin Port Type: %s\n", service.Origin.PortType)
+}
+
+func (r *ClcAdapter) dumpClcEnvironment() {
+	r.debugMessage("CLC_REG_DEBUG: %s\n", os.Getenv("CLC_REG_DEBUG"))
+	r.debugMessage("CLC_USERNAME: %s\n", os.Getenv("CLC_USERNAME"))
+	r.debugMessage("CLC_USER: %s\n", os.Getenv("CLC_USER"))
+	r.debugMessage("CLC_PASSWORD: %s\n", os.Getenv("CLC_PASSWORD"))
+	r.debugMessage("CLC_ALIAS: %s\n", os.Getenv("CLC_ALIAS"))
+	r.debugMessage("CLC_HOSTNAME: %s\n", os.Getenv("CLC_HOSTNAME"))
 }

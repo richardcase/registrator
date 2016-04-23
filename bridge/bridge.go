@@ -239,6 +239,9 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 
 	// RMC  - This is for testing purposes remove before completing
 	log.Printf("***Docker endpoint: %s", b.docker.Endpoint())
+	info, _ := b.docker.Info()
+	log.Println(info)
+
 	if port.HostIP == "" {
 		u, _ := url.Parse(b.docker.Endpoint())
 		hostparts := strings.Split(u.Host, ":")
