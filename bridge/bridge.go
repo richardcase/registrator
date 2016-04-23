@@ -241,6 +241,10 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 	log.Printf("***Docker endpoint: %s", b.docker.Endpoint())
 	info, _ := b.docker.Info()
 	log.Printf("***Docker name: %s", info.Name)
+	addrs, _ := net.LookupHost(info.Name)
+	for _, addr := range addrs {
+		log.Printf("Host address: %s", addr)
+	}
 
 	if port.HostIP == "" {
 		u, _ := url.Parse(b.docker.Endpoint())
