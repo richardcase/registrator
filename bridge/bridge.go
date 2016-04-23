@@ -239,12 +239,6 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 
 	// RMC  - This is for testing purposes remove before completing
 	log.Printf("***Docker endpoint: %s", b.docker.Endpoint())
-	info, _ := b.docker.Info()
-	log.Printf("***Docker name: %s", info.Name)
-	containers, _ := b.docker.ListContainers(dockerapi.ListContainersOptions{})
-	for _, container := range containers {
-		log.Println(container)
-	}
 
 	if port.HostIP == "" {
 		u, _ := url.Parse(b.docker.Endpoint())
